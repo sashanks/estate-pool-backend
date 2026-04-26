@@ -1,0 +1,49 @@
+version: '3.8'
+
+services:
+  ollama:
+    image: ollama/ollama:latest
+    container_name: neighborhood-ollama
+    ports:
+      - "11434:11434"
+    volumes:
+      - ollama_data:/root/.ollama
+    environment:
+      - OLLAMA_HOST=0.0.0.0:11434
+    profiles:
+      - ollama
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:11434/api/tags"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  api:
+    build: .
+    container_name: neighborhood-api
+    ports:
+      - "8000:8000"
+    environment:
+      - FIREBASE_CREDENTIALS_PATH=/app/firebase_credentials.json
+      - OLLAMA_BASE_URL=http://ollama:11434
+      - OLLAMA_MODEL=llama3.2
+      - CACHE_DIR=/app/cache
+    volumes:
+      - ./firebase_credentials.json:/app/firebase_credentials.json:ro
+      - ./cache:/app/cache
+      - ./.env:/app/.env:ro
+    depends_on:
+      - ollama
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+volumes:
+  ollama_data:
+
+# Usage:
+# docker-compose -p neighborhood up -d
+# docker-compose -p neighborhood logs -f api
+# docker-compose -p neighborhood down
