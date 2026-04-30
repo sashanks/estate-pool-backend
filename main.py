@@ -131,19 +131,34 @@ cache_manager = CacheManager(settings.cache_dir, settings.cache_ttl_seconds)
 
 async def fetch_firestore_civic_data(area_name: str, pincode: str) -> Dict[str, Any]:
     try:
-        query = db.collection("areas").where("name", "==", area_name).where("pincode", "==", pincode).limit(1)
-        docs = query.stream()
-        
         firestore_data = {}
         categories = ["education", "greenery", "health", "infrastructure", "religious_establishment", "transport"]
         
-        for doc in docs:
-            data = doc.to_dict()
-            for category in categories:
-                if category in data:
-                    firestore_data[category] = data[category]
+        # Convert pincode to int for Firestore query (stored as int64 in Firestore)
+        pincode_int = int(pincode)
+        # Pincodes are often stored as strings in Firestore.
+        # We will try both string and integer queries to handle any schema.
+        pincode_str = str(pincode)
+        pincode_int = int(pincode) if pincode.isdigit() else None
         
-        return firestore_data if firestore_data else {cat: [] for cat in categories}
+        for category in categories:
+            logger.debug(f"Querying Firestore Project: '{db.project}', Collection: '{category}'")
+            
+            query = db.collection(category).where("Pincode", "==", pincode_str).get()
+            if not query and pincode_int is not None:
+                query = db.collection(category).where("Pincode", "==", pincode_int).get()
+
+            category_items = []
+            if len(query) > 0:
+                logger.debug(f"Firestore: Found {len(query)} documents in category '{category}' for pincode {pincode}")
+                for doc in query:
+                    category_items.append(doc.to_dict())
+            else:
+                logger.error(f"Firestore: No documents found in category '{category}' for pincode {pincode}")
+            
+            firestore_data[category] = category_items
+            
+        return firestore_data
     except Exception as e:
         logger.error(f"Firestore fetch error: {str(e)}")
         return {cat: [] for cat in ["education", "greenery", "health", "infrastructure", "religious_establishment", "transport"]}
@@ -152,9 +167,10 @@ async def fetch_firestore_civic_data(area_name: str, pincode: str) -> Dict[str, 
 async def fetch_interesting_fact(area_name: str, pincode: str) -> str:
     query = f"interesting unknown historical fact about {area_name} {pincode}"
     try:
-        results = list(search(query, num=1, stop=1, pause=2))
+        # googlesearch-python uses 'num_results' and 'advanced=True' returns objects with a 'description'
+        results = list(search(query, num_results=1, advanced=True))
         if results:
-            return results[0]
+            return getattr(results[0], 'description', str(results[0]))
         return f"The area {area_name} ({pincode}) has a rich local heritage and diverse community."
     except Exception as e:
         logger.warning(f"Google search error: {str(e)}")
