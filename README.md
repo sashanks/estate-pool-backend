@@ -138,14 +138,6 @@ Content-Type: application/json
 {
   "area_name": "New Delhi",
   "pincode": "110001",
-  "firestore_data": {
-    "education": [...],
-    "greenery": [...],
-    "health": [...],
-    "infrastructure": [...],
-    "religious_establishment": [...],
-    "transport": [...]
-  },
   "fun_fact": "Delhi is one of the oldest inhabited cities in the world...",
   "ai_summary": "The neighborhood offers... [AI-generated analysis] ...\n\nDisclaimer: This summary is AI-generated...",
   "cached": false,

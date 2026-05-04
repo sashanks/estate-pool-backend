@@ -9,6 +9,7 @@ import hashlib
 from typing import Optional, Dict, Any
 from datetime import datetime
 import logging
+import httpx
 
 from fastapi import FastAPI, Depends, HTTPException, Header
 from pydantic import BaseModel, Field
@@ -53,7 +54,6 @@ class NeighborhoodSummaryResponse(BaseModel):
     """Response schema for neighborhood summary."""
     area_name: str
     pincode: str
-    firestore_data: Dict[str, Any]
     fun_fact: str
     ai_summary: str
     cached: bool
@@ -166,14 +166,39 @@ async def fetch_firestore_civic_data(area_name: str, pincode: str) -> Dict[str, 
 
 async def fetch_interesting_fact(area_name: str, pincode: str) -> str:
     query = f"interesting unknown historical fact about {area_name} {pincode}"
+    
+    # 1. Use SerpApi if configured (bypasses Google's 429 rate limits)
+    if settings.serpapi_key:
+        try:
+            async with httpx.AsyncClient() as client:
+                response = await client.get(
+                    "https://serpapi.com/search",
+                    params={
+                        "engine": "google",
+                        "q": query,
+                        "api_key": settings.serpapi_key,
+                        "num": 1
+                    },
+                    timeout=5.0
+                )
+                response.raise_for_status()
+                data = response.json()
+                if "organic_results" in data and len(data["organic_results"]) > 0:
+                    return data["organic_results"][0].get("snippet", f"The area {area_name} ({pincode}) has a rich local heritage.")
+        except Exception as e:
+            logger.warning(f"SerpApi search error: {str(e)}")
+
+    # 2. Fallback to native googlesearch-python
     try:
-        # googlesearch-python uses 'num_results' and 'advanced=True' returns objects with a 'description'
         results = list(search(query, num_results=1, advanced=True))
         if results:
             return getattr(results[0], 'description', str(results[0]))
         return f"The area {area_name} ({pincode}) has a rich local heritage and diverse community."
     except Exception as e:
-        logger.warning(f"Google search error: {str(e)}")
+        if "429" in str(e):
+            logger.warning(f"Google Search API rate-limited (429) for {area_name}. Using default fact.")
+        else:
+            logger.warning(f"Google search error: {str(e)}")
         return f"The area {area_name} ({pincode}) has a rich local heritage and diverse community."
 
 
@@ -250,7 +275,6 @@ async def neighborhood_summary(
         response_data = {
             "area_name": area_name,
             "pincode": pincode,
-            "firestore_data": firestore_data,
             "fun_fact": fun_fact,
             "ai_summary": ai_summary,
             "cached": False,
