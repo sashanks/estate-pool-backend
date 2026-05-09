@@ -49,6 +49,11 @@ class NeighborhoodSummaryRequest(BaseModel):
     area_name: str = Field(..., description="Name of the neighborhood/area")
     pincode: str = Field(..., description="Postal code of the area")
 
+class LogSearchRequest(BaseModel):
+    """Request schema for logging search activity independently."""
+    area_name: str = Field(..., description="Name of the neighborhood/area")
+    pincode: str = Field(..., description="Postal code of the area")
+
 
 class NeighborhoodSummaryResponse(BaseModel):
     """Response schema for neighborhood summary."""
@@ -128,6 +133,26 @@ class CacheManager:
 
 cache_manager = CacheManager(settings.cache_dir, settings.cache_ttl_seconds)
 
+def log_search_activity(user_id: str, area_name: str, pincode: str):
+    """Logs search activity to Firestore, incrementing count for user/location pairs."""
+    try:
+        # Normalize data: trim whitespace and ensure consistent casing for keys
+        clean_pincode = str(pincode).strip()
+        clean_area = area_name.strip()
+        
+        search_id = hashlib.md5(f"{user_id}:{clean_pincode}:{clean_area}".lower().encode()).hexdigest()
+        doc_ref = db.collection("search_analytics").document(search_id)
+        
+        doc_ref.set({
+            "user": user_id,
+            "pincode": clean_pincode,
+            "location": clean_area,
+            "timestamp": firestore.SERVER_TIMESTAMP,
+            "count": firestore.Increment(1)
+        }, merge=True)
+        logger.info(f"Search analytics updated for user {user_id} in {area_name}")
+    except Exception as e:
+        logger.error(f"Failed to log search activity: {str(e)}")
 
 async def fetch_firestore_civic_data(area_name: str, pincode: str) -> Dict[str, Any]:
     try:
@@ -259,6 +284,9 @@ async def neighborhood_summary(
     
     logger.info(f"Request for {area_name} ({pincode}) from user {user_id}")
     
+    # Log the search activity for analytics
+    log_search_activity(user_id, area_name, pincode)
+
     cached_data = cache_manager.get(pincode, area_name)
     if cached_data:
         cached_data["cached"] = True
@@ -288,6 +316,133 @@ async def neighborhood_summary(
     except Exception as e:
         logger.error(f"Endpoint error: {str(e)}")
         raise HTTPException(status_code=500, detail=f"Internal server error: {str(e)}")
+
+@app.post(
+    f"{settings.api_v1_prefix}/analytics/log-search",
+    status_code=204
+)
+async def log_search(
+    request: LogSearchRequest,
+    user_id: str = Depends(verify_firebase_token)
+):
+    """
+    Explicitly log a search activity from the frontend (e.g., when a user selects a location).
+    This ensures activity is recorded even if the full summary is not requested.
+    """
+    log_search_activity(user_id, request.area_name, request.pincode)
+
+@app.get(
+    f"{settings.api_v1_prefix}/analytics/searches",
+    status_code=200
+)
+async def get_search_analytics(
+    user: Optional[str] = None,
+    pincode: Optional[str] = None,
+    location: Optional[str] = None,
+    uid: str = Depends(verify_firebase_token)
+):
+    """Retrieve search analytics filtered by user, pincode, or location."""
+    try:
+        # Filter by current user if no specific user is requested
+        target_user = user if user else uid
+        query = db.collection("search_analytics").where("user", "==", target_user)
+
+        if pincode:
+            query = query.where("pincode", "==", pincode)
+        if location:
+            query = query.where("location", "==", location)
+            
+        docs = query.stream()
+        return [doc.to_dict() for doc in docs]
+    except Exception as e:
+        logger.error(f"Analytics retrieval error: {str(e)}")
+        raise HTTPException(status_code=500, detail="Failed to fetch analytics data")
+
+@app.delete(
+    f"{settings.api_v1_prefix}/analytics/searches",
+    status_code=204
+)
+async def delete_search_analytics(
+    uid: str = Depends(verify_firebase_token)
+):
+    """Clear all search history for the authenticated user."""
+    try:
+        docs = db.collection("search_analytics").where("user", "==", uid).stream()
+        batch = db.batch()
+        deleted_count = 0
+        for doc in docs:
+            batch.delete(doc.reference)
+            deleted_count += 1
+        
+        if deleted_count > 0:
+            batch.commit()
+            
+        logger.info(f"Cleared {deleted_count} search records for user {uid}")
+        return
+    except Exception as e:
+        logger.error(f"Failed to clear analytics: {str(e)}")
+        raise HTTPException(status_code=500, detail="Failed to clear search history")
+
+@app.get(
+    f"{settings.api_v1_prefix}/analytics/trending",
+    status_code=200
+)
+async def get_trending_locations(uid: str = Depends(verify_firebase_token)):
+    """Calculate trending locations based on the current user's pincode profile."""
+    try:
+        if uid == "test-user":
+            logger.info("Trending: Using default behavior for test-user (checking pincode 560066)")
+            # For dev testing if profile doesn't exist
+            user_pincode = "560066" 
+        else:
+            user_doc = db.collection("users").document(uid).get()
+            if not user_doc.exists:
+                logger.warning(f"Trending: User profile not found for UID: {uid}")
+                return []
+            
+            user_data = user_doc.to_dict()
+            user_pincode = user_data.get("pincode") or user_data.get("pinCode") or user_data.get("Pincode")
+        
+        if not user_pincode:
+            logger.warning(f"Trending: No pincode found in profile for UID: {uid}")
+            return []
+
+        # Normalize and query both string and int to handle legacy or inconsistent data
+        pincode_str = str(user_pincode).strip()
+        pincode_int = None
+        try:
+            pincode_int = int(pincode_str)
+        except ValueError:
+            pass
+
+        # Fetch documents matching string pincode
+        docs = list(db.collection("search_analytics").where("pincode", "==", pincode_str).stream())
+        
+        # Also fetch matching integer pincode if applicable
+        if pincode_int is not None:
+            int_docs = list(db.collection("search_analytics").where("pincode", "==", pincode_int).stream())
+            docs.extend(int_docs)
+            
+        logger.info(f"Trending: Found {len(docs)} analytics records for pincode {pincode_str}")
+        
+        # Aggregate totals by location name
+        totals = {}
+        loc_to_pin = {}
+        for doc in docs:
+            data = doc.to_dict()
+            loc = str(data.get("location", "")).strip().title() # Normalize display name
+            pin = data.get("pincode", "")
+            count = data.get("count", 0)
+            if loc:
+                totals[loc] = totals.get(loc, 0) + count
+                loc_to_pin[loc] = pin
+        
+        # Sort by count descending and return top 2
+        sorted_locs = sorted(totals.items(), key=lambda x: x[1], reverse=True)
+        return [{"location": loc, "count": count, "pincode": loc_to_pin[loc]} for loc, count in sorted_locs[:2]]
+    except Exception as e:
+        logger.error(f"Trending aggregation error: {str(e)}")
+        raise HTTPException(status_code=500, detail="Failed to fetch trending data")
 
 # ============================================================================
 # Health Check Endpoint
